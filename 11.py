@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 УРФУ магистратура — автосбор только очной формы.
-Стратегия: слушаем все XHR/Fetch ответы и вытаскиваем самые "тяжёлые" HTML,
-особенно /fileadmin/ratings/*.html. Затем парсим нужные колонки и распределяем.
+Собираем HTML-рейтинги, парсим, фильтруем по "Да, бюджет" (гибко) и
+распределяем абитуриентов алгоритмом отложенного принятия (Gale–Shapley style):
+кандидаты идут по приоритетам 1→2→…, программы держат у себя топ по баллам
+до заполнения квоты и вытесняют слабейших при приходе более сильных.
+Итог сохраняется в urfu_ochnaya.xlsx / urfu_ochnaya.csv.
 
 Зависимости:
     pip install playwright beautifulsoup4 pandas lxml
@@ -11,9 +14,10 @@
 
 import asyncio
 import re
+import heapq
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple, Any
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -41,7 +45,7 @@ def find_idx(headers, keys):
 
 def extract_header_meta(header_table) -> Dict[str, str]:
     """
-    Пары 'Название' -> 'Значение' из шапки (table.supp.table-header).
+    Достаём пары 'Название' -> 'Значение' из шапки (table.supp.table-header).
     Нужные: Институт (филиал), Направление (образовательная программа), План приема.
     """
     meta = {
@@ -65,7 +69,7 @@ def extract_header_meta(header_table) -> Dict[str, str]:
     return meta
 
 def parse_ratings_html(html: str, src_name: str) -> List[Dict]:
-    """Парсит только очные секции из html выгрузки УрФУ + метаданные из шапки."""
+    """Парсит только очные секции из html, добавляя метаданные из шапки."""
     soup = BeautifulSoup(html, "html.parser")
     rows: List[Dict] = []
 
@@ -107,8 +111,7 @@ def parse_ratings_html(html: str, src_name: str) -> List[Dict]:
                 "Направление (образовательная программа)": meta["Направление (образовательная программа)"],
                 "План приема": meta["План приема"],
                 "Источник": src_name,
-                # Контекст всей строки + мета (для эвристики бюджета)
-                "ROW_TEXT": (row_text_joined + " " + " ".join(meta.values())).strip(),
+                "ROW_TEXT": (row_text_joined + " " + " ".join(meta.values())).strip(),  # для гибкого фильтра бюджета
             }
             if rec["ID"]:
                 rows.append(rec)
@@ -249,7 +252,7 @@ async def run():
             )
             df[col] = pd.to_numeric(s, errors="coerce")
 
-    # ---- ФИЛЬТР: только с согласием на бюджет (более гибко) ----
+    # ---- ФИЛЬТР: только с согласием на бюджет (гибко) ----
     def is_budget_consent(consent: str, row_text: str) -> bool:
         c = str(consent or "").lower()
         r = str(row_text or "").lower()
@@ -277,59 +280,112 @@ async def run():
         print("После фильтра бюджетных согласий записей нет. Файлы сохранены пустыми.")
         return
 
-    # ---- Ёмкости направлений (квоты) ----
-    cap = (
+    # ---- Квоты (ёмкости) направлений ----
+    cap_series = (
         df.groupby(["Институт (филиал)", "Направление (образовательная программа)"])["План приема"]
           .max().fillna(0).astype(float).astype(int)
     )
-    seats = cap.to_dict()  # (институт, направление) -> оставшиеся места
+    seats: Dict[Tuple[str, str], int] = cap_series.to_dict()
 
-    # ---- РАУНДОВОЕ РАСПРЕДЕЛЕНИЕ ПО ПРИОРИТЕТАМ (чтобы направления заполнялись максимумом) ----
+    # ---- Подготовка данных для алгоритма отложенного принятия ----
+    # Нормализуем балл и приоритет
     df["Балл"] = df["Сумма конкурсных баллов"].fillna(0).astype(float)
+    df["Приоритет_norm"] = df["Приоритет"].fillna(1e9)
 
-    assigned_ids = set()
+    # Список предпочтений по каждому абитуриенту: по приоритетам возр.
+    # Каждый элемент — исходная строка (dict), чтобы отдать в результат выбранный вариант.
+    prefs: Dict[str, List[Dict[str, Any]]] = (
+        df.sort_values(by=["ID", "Приоритет_norm", "Балл"], ascending=[True, True, False], kind="mergesort")
+          .groupby("ID")
+          .apply(lambda g: g.to_dict("records"))
+          .to_dict()
+    )
+
+    # Балл на ID (обычно одинаков во всех заявках)
+    id_score = df.groupby("ID")["Балл"].max().to_dict()
+
+    # Очередь свободных абитуриентов и индекс следующего приоритета (куда ещё не предлагали)
+    next_choice_idx: Dict[str, int] = {aid: 0 for aid in prefs.keys()}
+    # Начальная очередь — все ID, сортировка по баллам ↓, затем ID ↑ для детерминизма
+    free_queue: List[str] = sorted(prefs.keys(), key=lambda k: (-id_score.get(k, 0.0), str(k)))
+
+    # Для каждой программы держим min-heap по (балл, ID) — на вершине слабейший
+    program_heaps: Dict[Tuple[str, str], List[Tuple[float, str]]] = {k: [] for k in seats.keys()}
+    # Текущее назначение: ID -> (key, chosen_rec)
+    assigned: Dict[str, Tuple[Tuple[str, str], Dict[str, Any]]] = {}
+
+    def try_propose(aid: str, rec: Dict[str, Any]) -> Tuple[bool, str]:
+        """Кандидат aid делает предложение программе rec. Возвращает (accepted, evicted_id or '')."""
+        key = (rec["Институт (филиал)"], rec["Направление (образовательная программа)"])
+        cap = seats.get(key, 0)
+        if cap <= 0:
+            return (False, "")
+        heap = program_heaps.setdefault(key, [])
+        score = float(id_score.get(aid, rec.get("Сумма конкурсных баллов", 0.0)) or 0.0)
+        item = (score, str(aid))
+        if len(heap) < cap:
+            heapq.heappush(heap, item)
+            assigned[aid] = (key, rec)
+            return (True, "")
+        # сравним с текущим слабейшим
+        weakest = heap[0]
+        if (score, str(aid)) > weakest:  # лучше — вытесняем
+            evicted_score, evicted_id = heapq.heapreplace(heap, item)
+            # найдём и уберём предыдущее назначение вытеснённого
+            if evicted_id in assigned:
+                del assigned[evicted_id]
+            assigned[aid] = (key, rec)
+            return (True, evicted_id)
+        return (False, "")
+
+    # --- Основной цикл отложенного принятия ---
+    while free_queue:
+        aid = free_queue.pop(0)
+        prefs_list = prefs.get(aid, [])
+        i = next_choice_idx.get(aid, 0)
+        # пропускаем пустые/нулевые приоритеты
+        while i < len(prefs_list) and seats.get((prefs_list[i]["Институт (филиал)"],
+                                                prefs_list[i]["Направление (образовательная программа)"]), 0) == 0:
+            i += 1
+        if i >= len(prefs_list):
+            continue  # у кандидата не осталось вариантов
+        rec = prefs_list[i]
+        accepted, evicted_id = try_propose(aid, rec)
+        if accepted:
+            next_choice_idx[aid] = i  # зафиксировали, куда встал (для протокола)
+            if evicted_id:
+                # вытеснённый идёт предлагаться дальше (следующий приоритет после того, где его вытеснили)
+                next_choice_idx[evicted_id] = (next_choice_idx.get(evicted_id, 0) + 1)
+                # если у него остались варианты — вернём в очередь, причём повыше (чтобы быстрее перераспределился)
+                if next_choice_idx[evicted_id] < len(prefs.get(evicted_id, [])):
+                    free_queue.insert(0, evicted_id)
+        else:
+            # отказ — пробуем следующий приоритет
+            next_choice_idx[aid] = i + 1
+            if next_choice_idx[aid] < len(prefs_list):
+                free_queue.append(aid)
+
+    # --- Формируем результат из назначений ---
     assigned_rows: List[Dict] = []
-
-    # максимальный реальный приоритет в данных
-    max_pr = int(df["Приоритет"].dropna().max()) if not df["Приоритет"].dropna().empty else 0
-
-    for p in range(1, max_pr + 1):
-        # заявки текущего приоритета у ещё не распределённых
-        round_apps = df[(~df["ID"].isin(assigned_ids)) & (df["Приоритет"] == p)].copy()
-        if round_apps.empty:
-            continue
-
-        # по баллам ↓, при равенстве — по ID ↑
-        round_apps = round_apps.sort_values(
-            by=["Балл", "ID"],
-            ascending=[False, True],
-            kind="mergesort"
-        )
-
-        for _, rec in round_apps.iterrows():
-            key = (rec["Институт (филиал)"], rec["Направление (образовательная программа)"])
-            if seats.get(key, 0) > 0 and rec["ID"] not in assigned_ids:
-                seats[key] -= 1
-                assigned_ids.add(rec["ID"])
-                assigned_rows.append({
-                    "ID": rec["ID"],
-                    "Согласие на зачисление": rec.get("Согласие на зачисление", ""),
-                    "Приоритет": rec.get("Приоритет", None),
-                    "Сумма конкурсных баллов": rec.get("Сумма конкурсных баллов", None),
-                    "Институт (филиал)": rec.get("Институт (филиал)", ""),
-                    "Направление (образовательная программа)": rec.get("Направление (образовательная программа)", ""),
-                    "План приема": cap.get(key, 0),
-                    "Источник": rec.get("Источник", "")
-                })
-        # следующий раунд p+1 будет добивать оставшиеся места
+    for aid, (key, rec) in assigned.items():
+        inst, prog = key
+        assigned_rows.append({
+            "ID": rec.get("ID", aid),
+            "Согласие на зачисление": rec.get("Согласие на зачисление", ""),
+            "Приоритет": rec.get("Приоритет", None),
+            "Сумма конкурсных баллов": rec.get("Сумма конкурсных баллов", None),
+            "Институт (филиал)": inst,
+            "Направление (образовательная программа)": prog,
+            "План приема": int(cap_series.get(key, 0)),
+            "Источник": rec.get("Источник", "")
+        })
 
     result = pd.DataFrame(assigned_rows)
 
-    # ---- Финал: чистим служебные поля, сортируем и сохраняем ----
-    for tmp in ("ROW_TEXT", "Балл"):
-        if tmp in result.columns:
-            result.drop(columns=[tmp], inplace=True, errors="ignore")
+    # Чистим служебные поля в исходном df (если будем сохранять промежуточный)
+    df.drop(columns=["ROW_TEXT", "Балл", "Приоритет_norm"], errors="ignore", inplace=True)
 
+    # Финальная сортировка и порядок колонок
     if not result.empty:
         result = result.sort_values(
             by=["Институт (филиал)", "Направление (образовательная программа)", "Приоритет", "Сумма конкурсных баллов"],
@@ -349,17 +405,23 @@ async def run():
     ]
     result = result[[c for c in final_cols if c in result.columns]].drop_duplicates()
 
-    # Диагностика: какие направления остались недозаполнёнными
-    unfilled = {k: v for k, v in seats.items() if v > 0}
-    if unfilled:
+    # Диагностика: оставшиеся свободные места по программам
+    # (факт может отличаться от cap - len(heap), если ни у кого нет заявки на программу)
+    remain = {}
+    for key, cap in seats.items():
+        heap = program_heaps.get(key, [])
+        left = max(int(cap) - len(heap), 0)
+        if left > 0:
+            remain[key] = left
+    if remain:
         print("[info] Недозаполненные направления (осталось мест):")
-        for (inst, prog), left in sorted(unfilled.items()):
+        for (inst, prog), left in sorted(remain.items()):
             print(f"  - {inst} / {prog}: {left}")
 
     # Выгрузка
     result.to_excel(OUT_XLSX, index=False)
     result.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"Готово (раундовое распределение по приоритетам):\n- {OUT_XLSX} (строк: {len(result)})\n- {OUT_CSV}")
+    print(f"Готово (отложенное принятие с вытеснениями):\n- {OUT_XLSX} (строк: {len(result)})\n- {OUT_CSV}")
 
 if __name__ == "__main__":
     asyncio.run(run())
