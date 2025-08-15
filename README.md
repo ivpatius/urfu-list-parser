@@ -4,4 +4,7 @@
 
 
 pip install playwright beautifulsoup4 pandas lxml
+
+
+
 python -m playwright install chromium
