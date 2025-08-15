@@ -2,6 +2,9 @@
 
 
 
+Зависимости:
+
+
 
 pip install playwright beautifulsoup4 pandas lxml
 
